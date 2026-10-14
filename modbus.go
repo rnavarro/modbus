@@ -18,6 +18,43 @@ func (me Error) Error() (s string) {
 	return
 }
 
+// FrameError wraps a framing error and carries the raw bytes received on the
+// wire for the frame that failed to decode or validate.
+//
+// It exists so that callers can tell a malformed reply that actually came from
+// a device apart from random line noise. The bytes are the exact prefix the
+// transport read for the failed frame; the transport makes no attempt to guess
+// a different frame layout.
+//
+// FrameError preserves the identity of the wrapped sentinel error, so
+// errors.Is(err, ErrBadCRC) (and errors.As) keep working:
+//
+//	var fe *modbus.FrameError
+//	if errors.Is(err, modbus.ErrBadCRC) && errors.As(err, &fe) {
+//		// fe.Frame holds the bytes received for the bad frame
+//	}
+type FrameError struct {
+	// Err is the sentinel transport error being wrapped, e.g. ErrBadCRC or
+	// ErrShortFrame.
+	Err error
+	// Frame holds a copy of the raw bytes received on the wire for the
+	// failed frame.
+	Frame []byte
+}
+
+// Error implements the error interface.
+func (fe *FrameError) Error() (s string) {
+	s = fe.Err.Error()
+	return
+}
+
+// Unwrap returns the wrapped sentinel error, preserving errors.Is and
+// errors.As behavior for callers matching on the library's error values.
+func (fe *FrameError) Unwrap() (err error) {
+	err = fe.Err
+	return
+}
+
 const (
 	// coils
 	fcReadCoils                  uint8 = 0x01

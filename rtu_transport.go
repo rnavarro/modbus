@@ -1,6 +1,7 @@
 package modbus
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -104,7 +105,7 @@ func (rt *rtuTransport) ExecuteRequest(req *pdu) (res *pdu, err error) {
 	// read the response back from the wire
 	res, err = rt.readRTUFrame()
 
-	if err == ErrBadCRC || err == ErrProtocolError || err == ErrShortFrame {
+	if errors.Is(err, ErrBadCRC) || errors.Is(err, ErrProtocolError) || errors.Is(err, ErrShortFrame) {
 		// wait for and flush any data coming off the link to allow
 		// devices to re-sync
 		time.Sleep(time.Duration(maxRTUFrameLength) * rt.t1)
@@ -156,7 +157,7 @@ func (rt *rtuTransport) readRTUFrame() (res *pdu, err error) {
 	// PDU length/exception code (1 byte)
 	byteCount, err	= io.ReadFull(rt.link, rxbuf[0:3])
 	if (byteCount > 0 || err == nil) && byteCount != 3 {
-		err = ErrShortFrame
+		err = &FrameError{Err: ErrShortFrame, Frame: frameBytes(rxbuf[:byteCount])}
 		return
 	}
 	if err != nil && err != io.ErrUnexpectedEOF {
@@ -184,7 +185,7 @@ func (rt *rtuTransport) readRTUFrame() (res *pdu, err error) {
 	}
 	if byteCount != bytesNeeded {
 		rt.logger.Warningf("expected %v bytes, received %v", bytesNeeded, byteCount)
-		err = ErrShortFrame
+		err = &FrameError{Err: ErrShortFrame, Frame: frameBytes(rxbuf[:3 + byteCount])}
 		return
 	}
 
@@ -194,7 +195,9 @@ func (rt *rtuTransport) readRTUFrame() (res *pdu, err error) {
 
 	// compare CRC values
 	if !crc.isEqual(rxbuf[3 + bytesNeeded - 2], rxbuf[3 + bytesNeeded - 1]) {
-		err = ErrBadCRC
+		// attach the bytes read for this frame so callers can inspect what
+		// the device actually sent instead of only seeing "bad crc"
+		err = &FrameError{Err: ErrBadCRC, Frame: frameBytes(rxbuf[:3 + bytesNeeded])}
 		return
 	}
 
@@ -250,6 +253,13 @@ func expectedResponseLenth(responseCode uint8, responseLength uint8) (byteCount 
 	default: err = ErrProtocolError
 	}
 
+	return
+}
+
+// frameBytes returns a copy of buf so that a FrameError retains the received
+// bytes independently of the transport's read buffer.
+func frameBytes(buf []byte) (frame []byte) {
+	frame = append(frame, buf...)
 	return
 }
 

@@ -1,6 +1,8 @@
 package modbus
 
 import (
+	"bytes"
+	"errors"
 	"testing"
 	"io"
 	"net"
@@ -112,8 +114,14 @@ func TestRTUTransportReadRTUFrame(t *testing.T) {
 		0xc0, 0xa2, // CRC
 	}
 	res, err = rt.readRTUFrame()
-	if err != ErrBadCRC {
-		t.Errorf("readRTUFrame() should have returned ErrBadCrc, got %v", err)
+	if !errors.Is(err, ErrBadCRC) {
+		t.Errorf("readRTUFrame() should have returned ErrBadCRC, got %v", err)
+	}
+	var fe *FrameError
+	if !errors.As(err, &fe) {
+		t.Errorf("expected a *FrameError carrying the frame, got %T", err)
+	} else if !bytes.Equal(fe.Frame, []byte{0x30, 0x82, 0x12, 0xc0, 0xa2}) {
+		t.Errorf("expected frame {30 82 12 c0 a2}, got % x", fe.Frame)
 	}
 
 	// read a longer, valid response
@@ -150,6 +158,135 @@ func TestRTUTransportReadRTUFrame(t *testing.T) {
 
 	p1.Close()
 	p2.Close()
+
+	return
+}
+
+func TestRTUTransportBadCRCErrorCarriesFrame(t *testing.T) {
+	var rt		*rtuTransport
+	var p1, p2	net.Conn
+	var txchan	chan []byte
+	var err		error
+	var fe		*FrameError
+
+	txchan = make(chan []byte, 1)
+	p1, p2 = net.Pipe()
+	go feedTestPipe(t, txchan, p1)
+
+	rt = newRTUTransport(p2, "", 9600, 100 * time.Millisecond, nil)
+	p2.SetDeadline(time.Now().Add(200 * time.Millisecond))
+
+	// non-standard 8-byte reply some devices use to reject an unsupported
+	// request: unit id, function code with the exception bit set, an echo of
+	// the request bytes 2-5 and a CRC. There is no exception code byte, so the
+	// library expects a 1-byte exception payload, reads the frame short and
+	// computes the CRC over the wrong span.
+	frame := withCRC([]byte{
+		0x01, 0x83,             // unit id and function code | 0x80
+		0x00, 0x00, 0x00, 0x01, // echo of the request bytes 2-5
+	})
+
+	txchan <- frame
+
+	_, err = rt.readRTUFrame()
+	if !errors.Is(err, ErrBadCRC) {
+		t.Fatalf("expected ErrBadCRC, got %v", err)
+	}
+	if !errors.As(err, &fe) {
+		t.Fatalf("expected a *FrameError carrying the frame, got %T", err)
+	}
+	// the library only read the 5 bytes it believed made up the frame
+	if !bytes.Equal(fe.Frame, frame[:5]) {
+		t.Errorf("expected frame % x, got % x", frame[:5], fe.Frame)
+	}
+
+	// drain the bytes the library did not read so the pipe writer can return
+	// before the test closes the pipe
+	io.ReadFull(p2, make([]byte, len(frame) - 5))
+
+	p1.Close()
+	p2.Close()
+
+	return
+}
+
+func TestRTUTransportShortFrameErrorCarriesFrame(t *testing.T) {
+	var rt		*rtuTransport
+	var p1, p2	net.Conn
+	var txchan	chan []byte
+	var err		error
+	var fe		*FrameError
+
+	txchan = make(chan []byte, 1)
+	p1, p2 = net.Pipe()
+	go feedTestPipe(t, txchan, p1)
+
+	rt = newRTUTransport(p2, "", 9600, 100 * time.Millisecond, nil)
+	p2.SetDeadline(time.Now().Add(200 * time.Millisecond))
+
+	// an incomplete header: the unit id and function code arrive, then the
+	// line goes quiet
+	txchan <- []byte{0x01, 0x83}
+
+	_, err = rt.readRTUFrame()
+	if !errors.Is(err, ErrShortFrame) {
+		t.Fatalf("expected ErrShortFrame, got %v", err)
+	}
+	if !errors.As(err, &fe) {
+		t.Fatalf("expected a *FrameError carrying the frame, got %T", err)
+	}
+	if !bytes.Equal(fe.Frame, []byte{0x01, 0x83}) {
+		t.Errorf("expected frame {01 83}, got % x", fe.Frame)
+	}
+
+	p1.Close()
+	p2.Close()
+
+	return
+}
+
+func TestRTUTransportValidFrameHasNoFrameError(t *testing.T) {
+	var rt		*rtuTransport
+	var p1, p2	net.Conn
+	var txchan	chan []byte
+	var err		error
+	var res		*pdu
+
+	txchan = make(chan []byte, 1)
+	p1, p2 = net.Pipe()
+	go feedTestPipe(t, txchan, p1)
+
+	rt = newRTUTransport(p2, "", 9600, 100 * time.Millisecond, nil)
+	p2.SetDeadline(time.Now().Add(200 * time.Millisecond))
+
+	txchan <- withCRC([]byte{0x01, 0x03, 0x02, 0x12, 0x34})
+
+	res, err = rt.readRTUFrame()
+	if err != nil {
+		t.Fatalf("readRTUFrame() should have succeeded, got %v", err)
+	}
+	if res.unitId != 0x01 || res.functionCode != 0x03 {
+		t.Errorf("unexpected response: unit 0x%02x, function 0x%02x",
+			 res.unitId, res.functionCode)
+	}
+	if errors.Is(err, ErrBadCRC) {
+		t.Errorf("a valid frame must not match ErrBadCRC")
+	}
+
+	p1.Close()
+	p2.Close()
+
+	return
+}
+
+// withCRC returns data with its modbus CRC appended.
+func withCRC(data []byte) (frame []byte) {
+	var c crc
+
+	frame = append(frame, data...)
+	c.init()
+	c.add(data)
+	frame = append(frame, c.value()...)
 
 	return
 }
